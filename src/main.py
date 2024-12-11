@@ -1,41 +1,65 @@
 import argparse
 import os
-import shutil
 from openai import OpenAI
-from pix2text import Pix2Text
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
-def extract_text(pdf_path, output_dir):
-    p2t = Pix2Text.from_config()
-    doc = p2t.recognize_pdf(pdf_path)
-    doc.to_markdown(output_dir)
-
-
-def translate(text):
+def translate(save_path):
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY_MINE"))
-    response = client.chat.completions.create(
-        model="gpt-4o",
+    assistant = client.beta.assistants.create(
+        instructions="You are a professor specializing in machine learning. Summarize the given paper.",
+        tools=[{"type": "file_search"}],
+        model="gpt-4o-mini",
+    )
+    vector_store = client.beta.vector_stores.create(name="PDFstore")
+    file_streams = [open(save_path, "rb")]
+
+    _ = client.beta.vector_stores.file_batches.upload_and_poll(
+        vector_store_id=vector_store.id, files=file_streams
+    )
+
+    assistant = client.beta.assistants.update(
+        assistant_id=assistant.id,
+        tool_resources={
+            "file_search": {"vector_store_ids": [vector_store.id]}
+        },
+        temperature=0,
+    )
+    message_file = client.files.create(
+        file=open(save_path, "rb"), purpose="assistants"
+    )
+
+    thread = client.beta.threads.create(
         messages=[
             {
-                "role": "system",
-                "content": "あなたは翻訳ツールです。入力されたMarkdownの文章を日本語で全て翻訳してください。翻訳結果以外の文章は出力しないでください。なお、インライン数式は$, $で、ブロック数式は$$, $$で囲われていることに注意してください。また、専門用語は無理に訳さず英語のまま表記してください。",
-            },
-            {"role": "user", "content": text},
-        ],
-        temperature=0.0,
+                "role": "user",
+                "content": "この論文を日本語で要約してください。ただし、以下の注意に従ってください。\n\n* 私は機械学習を専攻する博士課程の学生です。論文の背景や関連研究についてはよく知っているので、それ以外の部分の詳細を優先してまとめてください。\n* 論文の内容を過不足なく忠実にまとめてください。必要に応じて数式を用いて構わないので、正確に記述してください。\n* 論文中の1つの節が箇条書きの1つの項目に対応するように、箇条書きでまとめてください。要約が長くなっても構いません。",
+                "attachments": [
+                    {
+                        "file_id": message_file.id,
+                        "tools": [{"type": "file_search"}],
+                    }
+                ],
+            }
+        ]
     )
-    text_ja = response.choices[0].message.content
-    return text_ja
+
+    run = client.beta.threads.runs.create_and_poll(
+        thread_id=thread.id, assistant_id=assistant.id
+    )
+
+    messages = list(
+        client.beta.threads.messages.list(thread_id=thread.id, run_id=run.id)
+    )
+    response = messages[0].content[0].text.value
+    return response
 
 
 def main(pdf_path, output_dir):
-    shutil.rmtree(output_dir, ignore_errors=True)
-
-    extract_text(pdf_path, output_dir)
-
-    with open(f"{output_dir}/output.md", "r") as f:
-        text = f.read()
-    text_ja = translate(text)
+    text_ja = translate(pdf_path)
+    print(text_ja)
 
     with open(f"{output_dir}/output_ja.md", "w") as f:
         f.write(text_ja)
